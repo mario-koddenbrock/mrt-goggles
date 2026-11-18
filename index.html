@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MRT Goggles</title>
+<script src="vendor/dicomParser.min.js"></script>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  #bar { padding: 8px 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; background: #1c1c1c; }
+  button, select { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 4px 10px; border-radius: 4px; }
+  button.on { background: #3a6ea5; }
+  #main { flex: 1 1 0; display: flex; justify-content: center; align-items: center; min-height: 0; position: relative; }
+  canvas { height: 100%; max-width: 100%; cursor: crosshair; }
+  #drop { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; color: #888; pointer-events: none; }
+  #info { position: absolute; left: 10px; top: 10px; font-size: 12px; color: #9c9; white-space: pre; pointer-events: none; text-shadow: 0 0 3px #000; }
+  #msg { padding: 4px 12px; font-size: 12px; color: #e99; min-height: 16px; }
+  .warn { color: #fc6; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label><button onclick="pick.click()">Open DICOM folder</button></label>
+  <input id="pick" type="file" webkitdirectory multiple hidden>
+  <select id="series"></select>
+  <input id="slider" type="range" min="0" max="0" value="0" style="width:220px">
+  <span id="pos"></span>
+  <button id="mWL" class="on">Window/Level</button>
+  <button id="mRuler">Ruler (mm)</button>
+  <button id="clear">Clear ruler</button>
+  <span class="warn">Not a diagnosis. The radiologist's report is authoritative.</span>
+</div>
+<div id="msg"></div>
+<div id="main">
+  <div id="drop">Drop the DICOM folder here<br>(wheel = scroll slices, drag = window/level or ruler)</div>
+  <canvas id="cv"></canvas>
+  <div id="info"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+let seriesMap = {};      // uid -> {desc, items: [{ds, num}]}
+let cur = null;          // current series items
+let idx = 0, wc = 0, ww = 1, mode = 'wl';
+let img = null;          // {w,h,data(Float32Array),ps:[row,col]}
+let rulers = {};         // key "uid:idx" -> [{x1,y1,x2,y2}]
+let drag = null;
+
+const UNCOMPRESSED = ['1.2.840.10008.1.2', '1.2.840.10008.1.2.1'];
+
+async function loadFiles(files) {
+  seriesMap = {}; let skipped = 0, compressed = 0;
+  for (const f of files) {
+    let ds;
+    try { ds = dicomParser.parseDicom(new Uint8Array(await f.arrayBuffer())); }
+    catch (e) { skipped++; continue; }
+    if (!ds.elements.x7fe00010) { skipped++; continue; }
+    if (!UNCOMPRESSED.includes((ds.string('x00020010') || '').trim())) { compressed++; continue; }
+    const uid = ds.string('x0020000e');
+    const s = seriesMap[uid] ??= { desc: `${ds.string('x0008103e') || '?'} (${ds.string('x00180015') || ''})`, items: [] };
+    s.items.push({ ds, num: ds.intString('x00200013') ?? 0 });
+  }
+  for (const s of Object.values(seriesMap)) s.items.sort((a, b) => a.num - b.num);
+  const uids = Object.keys(seriesMap);
+  $('msg').textContent = `${uids.length} series. Skipped ${skipped} non-DICOM files.` +
+    (compressed ? ` ${compressed} files use compressed DICOM, not supported (export uncompressed).` : '');
+  $('series').innerHTML = uids.map(u => `<option value="${u}">${seriesMap[u].desc} [${seriesMap[u].items.length}]</option>`).join('');
+  if (uids.length) selectSeries(uids[0]);
+}
+
+function selectSeries(uid) {
+  cur = { uid, items: seriesMap[uid].items };
+  $('slider').max = cur.items.length - 1;
+  $('drop').style.display = 'none';
+  show(Math.floor(cur.items.length / 2), true);
+}
+
+function decode(ds) {
+  const rows = ds.uint16('x00280010'), cols = ds.uint16('x00280011');
+  const bits = ds.uint16('x00280100'), signed = ds.uint16('x00280103') === 1;
+  const el = ds.elements.x7fe00010, n = rows * cols;
+  const raw = ds.byteArray.slice(el.dataOffset, el.dataOffset + n * bits / 8).buffer; // copy -> aligned
+  const arr = bits === 8 ? new Uint8Array(raw) : signed ? new Int16Array(raw) : new Uint16Array(raw);
+  const slope = ds.floatString('x00281053') ?? 1, icpt = ds.floatString('x00281052') ?? 0;
+  const data = Float32Array.from(arr, v => v * slope + icpt);
+  const ps = (ds.string('x00280030') || '1\\1').split('\\').map(Number);
+  return { w: cols, h: rows, data, ps };
+}
+
+function show(i, resetWL = false) {
+  idx = Math.max(0, Math.min(cur.items.length - 1, i));
+  $('slider').value = idx;
+  const ds = cur.items[idx].ds;
+  img = decode(ds);
+  if (resetWL) {
+    const sorted = Float32Array.from(img.data).sort();
+    const lo = sorted[Math.floor(sorted.length * 0.01)], hi = sorted[Math.floor(sorted.length * 0.995)];
+    wc = (lo + hi) / 2; ww = Math.max(1, hi - lo);
+  }
+  cv.width = img.w; cv.height = img.h;
+  cv.style.aspectRatio = (img.w * img.ps[1]) / (img.h * img.ps[0]);
+  draw();
+}
+
+function draw() {
+  const id = ctx.createImageData(img.w, img.h), lo = wc - ww / 2;
+  for (let i = 0; i < img.data.length; i++) {
+    const v = Math.max(0, Math.min(255, (img.data[i] - lo) / ww * 255));
+    id.data[4 * i] = id.data[4 * i + 1] = id.data[4 * i + 2] = v; id.data[4 * i + 3] = 255;
+  }
+  ctx.putImageData(id, 0, 0);
+  ctx.lineWidth = Math.max(1, img.w / 300); ctx.font = `${Math.max(10, img.w / 40)}px sans-serif`;
+  ctx.strokeStyle = ctx.fillStyle = '#ff0';
+  for (const r of [...(rulers[key()] || []), ...(drag?.r ? [drag.r] : [])]) {
+    ctx.beginPath(); ctx.moveTo(r.x1, r.y1); ctx.lineTo(r.x2, r.y2); ctx.stroke();
+    const m = measure(r);
+    ctx.fillText(`${m.len.toFixed(1)} mm  (dx ${m.dx.toFixed(1)})`, r.x2 + 4, r.y2);
+  }
+  const ds = cur.items[idx].ds;
+  $('pos').textContent = `${idx + 1}/${cur.items.length}`;
+  $('info').textContent = `${seriesMap[cur.uid].desc}\nslice ${idx + 1}/${cur.items.length}  loc ${ds.string('x00201041') || '-'}\n` +
+    `pixel ${img.ps[1]} x ${img.ps[0]} mm\nW ${ww.toFixed(0)}  L ${wc.toFixed(0)}`;
+}
+
+const key = () => `${cur.uid}:${idx}`;
+// dx = offset along image x-axis (anterior-posterior axis on a sagittal image), the number that matters for a slip
+const measure = r => {
+  const dx = Math.abs(r.x2 - r.x1) * img.ps[1], dy = Math.abs(r.y2 - r.y1) * img.ps[0];
+  return { dx, dy, len: Math.hypot(dx, dy) };
+};
+const toImg = e => { const b = cv.getBoundingClientRect(); return [(e.clientX - b.left) / b.width * img.w, (e.clientY - b.top) / b.height * img.h]; };
+
+cv.addEventListener('mousedown', e => {
+  if (!cur) return;
+  const [x, y] = toImg(e);
+  drag = mode === 'ruler' ? { r: { x1: x, y1: y, x2: x, y2: y } } : { sx: e.clientX, sy: e.clientY, wc, ww };
+});
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  if (drag.r) { [drag.r.x2, drag.r.y2] = toImg(e); }
+  else { ww = Math.max(1, drag.ww + (e.clientX - drag.sx) * drag.ww / 300); wc = drag.wc + (e.clientY - drag.sy) * drag.ww / 300; }
+  draw();
+});
+window.addEventListener('mouseup', () => {
+  if (drag?.r) (rulers[key()] ??= []).push(drag.r);
+  drag = null; if (cur) draw();
+});
+cv.addEventListener('wheel', e => { e.preventDefault(); if (cur) show(idx + Math.sign(e.deltaY)); }, { passive: false });
+window.addEventListener('keydown', e => { if (cur && e.key === 'ArrowUp') show(idx - 1); if (cur && e.key === 'ArrowDown') show(idx + 1); });
+$('slider').oninput = e => show(+e.target.value);
+$('series').onchange = e => selectSeries(e.target.value);
+$('pick').onchange = e => loadFiles([...e.target.files]);
+$('mWL').onclick = () => { mode = 'wl'; $('mWL').classList.add('on'); $('mRuler').classList.remove('on'); };
+$('mRuler').onclick = () => { mode = 'ruler'; $('mRuler').classList.add('on'); $('mWL').classList.remove('on'); };
+$('clear').onclick = () => { if (cur) { delete rulers[key()]; draw(); } };
+
+// drag and drop of a folder
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', async e => {
+  e.preventDefault();
+  const out = [];
+  const walk = async entry => {
+    if (entry.isFile) out.push(await new Promise(r => entry.file(r)));
+    else { const rd = entry.createReader(); let b; do { b = await new Promise(r => rd.readEntries(r)); for (const c of b) await walk(c); } while (b.length); }
+  };
+  const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry());
+  for (const en of entries) await walk(en);
+  loadFiles(out);
+});
+</script>
+</body>
+</html>

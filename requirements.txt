@@ -1,0 +1,5 @@
+numpy==2.2.*
+pydicom==3.0.*
+pytest==8.*
+playwright==1.*
+pillow==11.*
